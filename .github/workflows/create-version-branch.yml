@@ -3,6 +3,9 @@ name: Create Version Branch v1.1.x
 on:
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   create-version-branch:
     runs-on: ubuntu-latest
