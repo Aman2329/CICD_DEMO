@@ -1,104 +1,137 @@
 name: Generate Release Branch
 
 on:
-  workflow_dispatch:
+    workflow_dispatch:
+        inputs:
+            ref:
+                description: "Branch to create the release from"
+                required: true
+                type: choice
+                default: develop
+                options:
+                    - develop
+                    # - main
 
 permissions:
-  contents: write
+    contents: write
 
 jobs:
-  generate-release-branch:
-    runs-on: ubuntu-latest
+    generate-release-branch:
+        runs-on: ubuntu-latest
 
-    steps:
-      #  Allow workflow ONLY from develop
-      - name: Restrict workflow to develop branch
-        run: |
-          if [ "${GITHUB_REF_NAME}" != "develop" ]; then
-            echo "❌ This workflow can only be run from the develop branch"
-            echo "➡️ Selected branch: ${GITHUB_REF_NAME}"
-            exit 1
-          fi
+        steps:
+            # Checkout full repository history
+            - name: Checkout repository
+              uses: actions/checkout@v4
+              with:
+                  fetch-depth: 0
+                  ref: ${{ github.event.inputs.ref }}
 
-      #  Checkout full repository history
-      - name: Checkout repository
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
+            # Configure Git identity
+            - name: Configure Git
+              run: |
+                  git config user.name "github-actions"
+                  git config user.email "github-actions@github.com"
 
-      #  Configure Git identity
-      - name: Configure Git
-        run: |
-          git config user.name "github-actions"
-          git config user.email "github-actions@github.com"
+            # Calculate next release-1.1.x version
+            - name: Calculate next release version
+              id: release
+              run: |
+                  set -e
+                  git fetch --all
 
-      #  Calculate next release-1.1.x version (STRICT & SAFE)
-      - name: Calculate next release version
-        id: release
-        run: |
-          set -e
-          git fetch --all
+                  latest_release=$(git branch -r \
+                    | grep -E "^\s*origin/release-1\.1\.[0-9]+$" \
+                    | sed 's|origin/||' \
+                    | sed 's/^[[:space:]]*//' \
+                    | sort -V \
+                    | tail -n 1)
 
-          # Match ONLY release-1.1.X where X is numeric
-          latest_release=$(git branch -r \
-            | grep -E "^\s*origin/release-1\.1\.[0-9]+$" \
-            | sed 's|origin/||' \
-            | sed 's/^[[:space:]]*//' \
-            | sort -V \
-            | tail -n 1)
+                  if [ -z "$latest_release" ]; then
+                    version="1.1.0"
+                  else
+                    patch=$(echo "$latest_release" | awk -F. '{print $3}')
 
-          if [ -z "$latest_release" ]; then
-            version="1.1.0"
-          else
-            patch=$(echo "$latest_release" | awk -F. '{print $3}')
+                    if ! [[ "$patch" =~ ^[0-9]+$ ]]; then
+                      echo "Failed to extract valid patch number from: $latest_release"
+                      exit 1
+                    fi
 
-            if ! [[ "$patch" =~ ^[0-9]+$ ]]; then
-              echo "❌ Failed to extract valid patch number from: $latest_release"
-              exit 1
-            fi
+                    next_patch=$((patch + 1))
+                    version="1.1.$next_patch"
+                  fi
 
-            next_patch=$((patch + 1))
-            version="1.1.$next_patch"
-          fi
+                  echo "version=$version" >> "$GITHUB_OUTPUT"
+                  echo "release_branch=release-$version" >> "$GITHUB_OUTPUT"
+                  echo "tag=v$version" >> "$GITHUB_OUTPUT"
 
-          echo "version=$version" >> $GITHUB_OUTPUT
-          echo "release_branch=release-$version" >> $GITHUB_OUTPUT
-          echo "tag=v$version" >> $GITHUB_OUTPUT
+            # Create release branch from develop
+            - name: Create and push release branch
+              run: |
+                  set -e
 
-      #  Create release branch FROM develop (duplicate-safe)
-      - name: Create and push release branch
-        run: |
-          set -e
+                  if git ls-remote --heads origin "${{ steps.release.outputs.release_branch }}" | grep -q "${{ steps.release.outputs.release_branch }}"; then
+                    echo "Release branch already exists remotely: ${{ steps.release.outputs.release_branch }}"
+                    exit 1
+                  fi
 
-          # Prevent duplicate branch creation
-          if git ls-remote --heads origin "${{ steps.release.outputs.release_branch }}" | grep -q "${{ steps.release.outputs.release_branch }}"; then
-            echo "❌ Branch ${{ steps.release.outputs.release_branch }} already exists remotely"
-            exit 1
-          fi
+                  git checkout ${{ github.event.inputs.ref }}
+                  git pull origin ${{ github.event.inputs.ref }}
 
-          git checkout develop
-          git pull origin develop
+                  git checkout -b "${{ steps.release.outputs.release_branch }}"
+                  git push origin "${{ steps.release.outputs.release_branch }}"
 
-          git checkout -b ${{ steps.release.outputs.release_branch }}
-          git push origin ${{ steps.release.outputs.release_branch }}
+            # Update package.json version on release branch
+            - name: Update package.json version
+              run: |
+                  set -e
+                  VERSION="${{ steps.release.outputs.version }}"
 
-      #  Create and push Git tag
-      - name: Create and push Git tag
-        run: |
-          git tag ${{ steps.release.outputs.tag }}
-          git push origin ${{ steps.release.outputs.tag }}
+                  if [ ! -f "package.json" ]; then
+                    echo "package.json not found, skipping version update"
+                    exit 0
+                  fi
 
-      #  Create GitHub Release
-      - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ steps.release.outputs.tag }}
-          name: Release ${{ steps.release.outputs.tag }}
-          body: |
-            🚀 **Release ${{ steps.release.outputs.tag }}**
+                  node -e "
+                    const fs = require('fs');
+                    const pkg = JSON.parse(fs.readFileSync('package.json', 'utf8'));
+                    if (pkg.version !== '${VERSION}') {
+                      pkg.version = '${VERSION}';
+                      fs.writeFileSync('package.json', JSON.stringify(pkg, null, 2) + '\n');
+                    }
+                  "
 
-            - Branch: `${{ steps.release.outputs.release_branch }}`
-            - Source: `develop`
-            - Repository: `rb-sales`
+                  git add "package.json"
 
-            Generated automatically via GitHub Actions.
+                  if git diff --cached --quiet; then
+                    echo "No changes to package.json, skipping commit"
+                  else
+                    git commit -m "chore(release): bump version to ${VERSION}"
+                    git push origin HEAD
+                  fi
+
+            # Create and push Git tag
+            - name: Create and push Git tag
+              run: |
+                  set -e
+
+                  if git ls-remote --tags origin "refs/tags/${{ steps.release.outputs.tag }}" | grep -q "${{ steps.release.outputs.tag }}"; then
+                    echo "Tag already exists remotely: ${{ steps.release.outputs.tag }}"
+                    exit 1
+                  fi
+
+                  git tag "${{ steps.release.outputs.tag }}"
+                  git push origin "${{ steps.release.outputs.tag }}"
+
+            # Create GitHub Release
+            - name: Create GitHub Release
+              uses: softprops/action-gh-release@v2
+              with:
+                  tag_name: "${{ steps.release.outputs.tag }}"
+                  name: "Release ${{ steps.release.outputs.tag }}"
+                  body: |
+                      Release ${{ steps.release.outputs.tag }}
+
+                      Branch: ${{ steps.release.outputs.release_branch }}
+                      Source: ${{ github.event.inputs.ref }}
+                      Repository: rb-sales
